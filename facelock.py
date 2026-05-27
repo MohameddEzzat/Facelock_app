@@ -460,10 +460,13 @@ RED_BGR   = (40, 40, 192)
 GREEN_BGR = (80, 200, 60)
 DARK_BGR  = (20, 13, 10)
 WHITE_BGR = (210, 218, 228)
+MANUAL_BGR = (220, 180, 80)
 
-def draw_hud(frame, faces, effect, intensity, mode, fps, frame_count, skipped_faces=None, show_boxes=True):
+def draw_hud(frame, faces, effect, intensity, mode, fps, frame_count, skipped_faces=None, show_boxes=True, manual_boxes=None, selected_manual_index=None):
     if skipped_faces is None:
         skipped_faces = []
+    if manual_boxes is None:
+        manual_boxes = []
 
     h, w = frame.shape[:2]
     ts = time.strftime("%H:%M:%S")
@@ -519,6 +522,21 @@ def draw_hud(frame, faces, effect, intensity, mode, fps, frame_count, skipped_fa
         for box in skipped_faces:
             draw_box(box, GREEN_BGR, GREEN_BGR, "[ VISIBLE ]")
 
+        # Manual boxes are user-positioned privacy zones for missed faces
+        for index, box in enumerate(manual_boxes):
+            x1, y1, x2, y2 = box
+            draw_box(box, MANUAL_BGR, MANUAL_BGR, "[ MANUAL ]")
+            if selected_manual_index == index:
+                handle = 6
+                for hx, hy in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+                    cv2.rectangle(
+                        frame,
+                        (hx - handle, hy - handle),
+                        (hx + handle, hy + handle),
+                        MANUAL_BGR,
+                        -1
+                    )
+
     return frame
 
 
@@ -542,7 +560,22 @@ class FacelockApp:
         self.filter_mode = tk.StringVar(value="balanced")
         self.playback_speed = tk.StringVar(value="1x")
         self.video_progress = tk.IntVar(value=0)
+        self.paused = tk.BooleanVar(value=False)
+        self.manual_time_var = tk.StringVar(value="No manual box selected")
         self.source_mode  = tk.StringVar(value="none")   # none | webcam | image | video
+
+        # Thread-safe mirror values
+        # Tkinter variables must only be touched by the Tk main thread.
+        # The video/webcam worker thread reads these plain Python values instead.
+        self.effect_value = "blur"
+        self.intensity_value = 30
+        self.show_boxes_value = True
+        self.detect_every_value = 3
+        self.filter_mode_value = "balanced"
+        self.playback_speed_value_cached = 1.0
+        self.paused_value = False
+        self.source_mode_value = "none"
+
         self.running      = False
         self.cap          = None
         self.current_image_path = None
@@ -577,6 +610,8 @@ class FacelockApp:
         self._video_seek_lock = threading.Lock()
         self._pending_seek_frame = None
         self._last_video_ui_update = 0
+        self._current_video_frame = 0
+        self._last_raw_video_frame = None
 
         # Tkinter draw throttling
         # Keeps the UI responsive by avoiding a long queue of canvas redraws
@@ -589,12 +624,30 @@ class FacelockApp:
         # Clicking a detected box toggles that face between anonymized and visible
         self.current_faces = []
         self.disabled_faces = []
-        self._faces_lock = threading.Lock()
+        self._faces_lock = threading.RLock()
         self._display_info = None
         self._selection_iou_threshold = 0.20
 
+        # Manual ready boxes
+        # These are user-controlled privacy boxes used when YuNet misses a face
+        # Each entry stores a box plus optional video timing
+        # start_frame = first video frame where the manual box is active
+        # end_frame = last active video frame, or None to keep it until the end
+        self.manual_boxes = []
+        self.selected_manual_box_index = None
+        self._manual_drag_mode = None
+        self._manual_drag_start = None
+        self._manual_drag_start_box = None
+        self._manual_min_size = 18
+
+        self._ui_closed = False
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Main-thread frame polling
+        # The worker thread only stores the newest frame.
+        # Tkinter drawing stays on the main thread even while the user drags manual boxes.
+        self._poll_pending_frame()
 
     # ─── UI BUILDER ──────────────────────────
     def _build_ui(self):
@@ -651,7 +704,9 @@ class FacelockApp:
                                 highlightthickness=0, cursor="crosshair")
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-        self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_mouse_down)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_mouse_up)
 
         # Idle overlay text
         self._idle_id = self.canvas.create_text(
@@ -880,6 +935,31 @@ class FacelockApp:
 
         self.btn_boxes = self._action_btn(box_frame, "▣  BOXES ON", GOLD2, self._toggle_boxes, 0)
 
+        # ── MANUAL BOXES ───────────────────────
+        row = self._section(sb, "MANUAL BOXES", row)
+        manual_frame = tk.Frame(sb, bg=BG)
+        manual_frame.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        manual_frame.columnconfigure(0, weight=1)
+        row += 1
+
+        self.btn_manual_add = self._action_btn(manual_frame, "+  ADD READY BOX", GOLD2, self._add_manual_box, 0)
+        self.btn_manual_remove_at_current = self._action_btn(manual_frame, "⏱  REMOVE AT CURRENT TIME", GOLD, self._set_selected_manual_end_current, 1)
+        self.btn_manual_keep_to_end = self._action_btn(manual_frame, "∞  KEEP UNTIL VIDEO END", SILVER, self._clear_selected_manual_end, 2)
+        self.btn_manual_remove = self._action_btn(manual_frame, "×  REMOVE SELECTED BOX", RED, self._remove_selected_manual_box, 3)
+        self.btn_manual_clear = self._action_btn(manual_frame, "□  CLEAR MANUAL BOXES", SILVER, self._clear_manual_boxes, 4)
+
+        tk.Label(
+            manual_frame,
+            textvariable=self.manual_time_var,
+            font=(FONT_MONO, 7), bg=BG, fg=GOLD2, anchor="w", wraplength=250
+        ).grid(row=5, column=0, sticky="ew", padx=4, pady=(5, 0))
+
+        tk.Label(
+            manual_frame,
+            text="Pause or seek to the frame you want then set when the selected manual box should be removed",
+            font=(FONT_MONO, 7), bg=BG, fg=BORDER, anchor="w", wraplength=250
+        ).grid(row=6, column=0, sticky="ew", padx=4, pady=(5, 0))
+
         # ── ACTIONS ────────────────────────────
         row = self._section(sb, "ACTIONS", row)
         act_frame = tk.Frame(sb, bg=BG)
@@ -888,10 +968,12 @@ class FacelockApp:
         row += 1
 
         self.btn_start = self._action_btn(act_frame, "▶  START", GOLD, self._start_action, 0)
-        self.btn_stop  = self._action_btn(act_frame, "■  STOP",  RED,  self._stop_action,  1)
-        self.btn_save  = self._action_btn(act_frame, "⬇  SAVE FRAME", SILVER, self._save_frame, 2)
-        self.btn_rec   = self._action_btn(act_frame, "⏺  RECORD VIDEO", "#E67E22", self._toggle_record, 3)
+        self.btn_pause = self._action_btn(act_frame, "Ⅱ  PAUSE VIDEO", GOLD2, self._toggle_pause, 1)
+        self.btn_stop  = self._action_btn(act_frame, "■  STOP",  RED,  self._stop_action,  2)
+        self.btn_save  = self._action_btn(act_frame, "⬇  SAVE FRAME", SILVER, self._save_frame, 3)
+        self.btn_rec   = self._action_btn(act_frame, "⏺  RECORD VIDEO", "#E67E22", self._toggle_record, 4)
 
+        self.btn_pause.configure(state="disabled", fg=BORDER)
         self.btn_stop.configure(state="disabled", fg=BORDER)
         self.btn_save.configure(state="disabled", fg=BORDER)
         self.btn_rec.configure(state="disabled", fg=BORDER)
@@ -924,6 +1006,10 @@ class FacelockApp:
             ("P", "Pixel"),
             ("R", "Redact"),
             ("X", "Toggle boxes"),
+            ("M", "Add manual box"),
+            ("Space", "Pause video"),
+            ("T", "Remove manual here"),
+            ("Del", "Remove manual"),
             ("A", "Anonymize all"),
             ("F", "Cycle filter"),
             ("+", "Intensity up"),
@@ -1013,27 +1099,149 @@ class FacelockApp:
         self.canvas.coords(self._idle_id, event.width // 2, event.height // 2 - 15)
         self.canvas.coords(self._idle_sub, event.width // 2, event.height // 2 + 15)
 
-    def _on_canvas_click(self, event):
-        """
-        Click a detected face box to remove it from anonymization
-        Click the same box again to anonymize it again
-        The box display can be hidden without changing anonymization
-        """
+    def _canvas_to_frame(self, event):
+        """Convert a Tkinter canvas point into original frame coordinates."""
         if self._display_info is None:
-            return
+            return None
 
         scale, offset_x, offset_y, original_w, original_h = self._display_info
+        if scale <= 0:
+            return None
 
         frame_x = int((event.x - offset_x) / scale)
         frame_y = int((event.y - offset_y) / scale)
 
         if frame_x < 0 or frame_y < 0 or frame_x >= original_w or frame_y >= original_h:
-            return
+            return None
 
+        return frame_x, frame_y, scale, original_w, original_h
+
+    def _on_canvas_mouse_down(self, event):
+        """
+        Drag or resize manual boxes first.
+        If no manual box is hit, click detected boxes to toggle anonymization.
+        """
+        try:
+            point = self._canvas_to_frame(event)
+            if point is None:
+                return
+
+            frame_x, frame_y, scale, original_w, original_h = point
+            manual_hit = self._hit_manual_box(frame_x, frame_y, scale)
+
+            if manual_hit is not None:
+                index, mode = manual_hit
+                selected = False
+
+                with self._faces_lock:
+                    if 0 <= index < len(self.manual_boxes):
+                        self.selected_manual_box_index = index
+                        self._manual_drag_mode = mode
+                        self._manual_drag_start = (frame_x, frame_y)
+                        self._manual_drag_start_box = self._manual_box_tuple(self.manual_boxes[index])
+                        selected = True
+
+                # Important: do UI/Tk updates after releasing the face lock.
+                # This prevents the app from freezing when a manual box is clicked.
+                if selected:
+                    self.show_boxes_value = True
+                    self.show_boxes.set(True)
+                    self._refresh_boxes_button()
+                    self._refresh_manual_time_label()
+                    self._set_status("MANUAL BOX SELECTED — DRAG OR RESIZE IT", GOLD)
+                return
+
+            self._toggle_detected_face_at(frame_x, frame_y)
+
+        except Exception:
+            import traceback
+            print("[FACELOCK] Manual box mouse down failed")
+            traceback.print_exc()
+            self._set_status("MANUAL BOX ERROR — CHECK TERMINAL", RED)
+
+    def _canvas_to_frame_clamped(self, event):
+        """Convert a canvas point into frame coordinates and clamp it inside the current frame."""
+        if self._display_info is None:
+            return None
+
+        scale, offset_x, offset_y, original_w, original_h = self._display_info
+        if scale <= 0:
+            return None
+
+        frame_x = int((event.x - offset_x) / scale)
+        frame_y = int((event.y - offset_y) / scale)
+        frame_x = max(0, min(original_w - 1, frame_x))
+        frame_y = max(0, min(original_h - 1, frame_y))
+        return frame_x, frame_y, scale, original_w, original_h
+
+    def _on_canvas_mouse_drag(self, event):
+        try:
+            if self._manual_drag_mode is None or self._manual_drag_start is None or self._manual_drag_start_box is None:
+                return
+
+            # During dragging/resizing, allow the pointer to leave the image area.
+            # Clamping keeps the box valid and prevents None-coordinate crashes.
+            point = self._canvas_to_frame_clamped(event)
+            if point is None:
+                return
+
+            frame_x, frame_y, scale, original_w, original_h = point
+            start_x, start_y = self._manual_drag_start
+            dx = frame_x - start_x
+            dy = frame_y - start_y
+            x1, y1, x2, y2 = self._manual_drag_start_box
+
+            mode = self._manual_drag_mode
+            if mode == "move":
+                new_box = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+            elif mode == "resize_tl":
+                new_box = (x1 + dx, y1 + dy, x2, y2)
+            elif mode == "resize_tr":
+                new_box = (x1, y1 + dy, x2 + dx, y2)
+            elif mode == "resize_bl":
+                new_box = (x1 + dx, y1, x2, y2 + dy)
+            elif mode == "resize_br":
+                new_box = (x1, y1, x2 + dx, y2 + dy)
+            else:
+                return
+
+            new_box = self._clamp_manual_box(new_box, original_w, original_h)
+
+            with self._faces_lock:
+                index = self.selected_manual_box_index
+                if index is not None and 0 <= index < len(self.manual_boxes):
+                    self._set_manual_box_tuple_locked(index, new_box)
+
+            # When the video is paused, redraw the same frame from the worker loop.
+            # Do not call Tkinter canvas methods directly from this mouse event.
+            if self.paused_value and self._last_raw_video_frame is not None:
+                pass
+
+        except Exception:
+            import traceback
+            print("[FACELOCK] Manual box drag failed")
+            traceback.print_exc()
+            self._set_status("MANUAL BOX DRAG ERROR — CHECK TERMINAL", RED)
+            self._manual_drag_mode = None
+            self._manual_drag_start = None
+            self._manual_drag_start_box = None
+
+    def _on_canvas_mouse_up(self, event):
+        try:
+            if self._manual_drag_mode is not None:
+                self._set_status("MANUAL BOX UPDATED", GREEN)
+        finally:
+            self._manual_drag_mode = None
+            self._manual_drag_start = None
+            self._manual_drag_start_box = None
+
+    def _toggle_detected_face_at(self, frame_x, frame_y):
+        """Click a detected box to remove or re-add it to anonymization."""
         with self._faces_lock:
+            manual_set = {tuple(box) for _, box in self._get_active_manual_entries_locked()}
             candidates = [
                 box for box in self.current_faces
-                if self._point_inside_box(frame_x, frame_y, box)
+                if tuple(box) not in manual_set and self._point_inside_box(frame_x, frame_y, box)
             ]
 
             if not candidates:
@@ -1057,6 +1265,252 @@ class FacelockApp:
             else:
                 self.disabled_faces.append(clicked_box)
                 self._set_status("FACE REMOVED FROM ANONYMIZATION", GOLD)
+
+    def _hit_manual_box(self, frame_x, frame_y, scale):
+        """Return (index, drag_mode) if the pointer is on a manual box or one of its corner handles."""
+        handle_radius = max(8, int(9 / max(scale, 0.01)))
+
+        with self._faces_lock:
+            active_entries = self._get_active_manual_entries_locked()
+            # Reverse order means the most recently added active box gets priority
+            for index, box in reversed(active_entries):
+                x1, y1, x2, y2 = box
+                handles = [
+                    ("resize_tl", x1, y1),
+                    ("resize_tr", x2, y1),
+                    ("resize_bl", x1, y2),
+                    ("resize_br", x2, y2),
+                ]
+
+                for mode, hx, hy in handles:
+                    if abs(frame_x - hx) <= handle_radius and abs(frame_y - hy) <= handle_radius:
+                        return index, mode
+
+                if self._point_inside_box(frame_x, frame_y, (x1, y1, x2, y2)):
+                    return index, "move"
+
+        return None
+
+    def _clamp_manual_box(self, box, original_w, original_h):
+        x1, y1, x2, y2 = [int(round(v)) for v in box]
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+
+        min_size = self._manual_min_size
+        x1 = max(0, min(original_w - 1, x1))
+        y1 = max(0, min(original_h - 1, y1))
+        x2 = max(1, min(original_w, x2))
+        y2 = max(1, min(original_h, y2))
+
+        if x2 - x1 < min_size:
+            if x1 + min_size <= original_w:
+                x2 = x1 + min_size
+            else:
+                x1 = max(0, x2 - min_size)
+
+        if y2 - y1 < min_size:
+            if y1 + min_size <= original_h:
+                y2 = y1 + min_size
+            else:
+                y1 = max(0, y2 - min_size)
+
+        return (x1, y1, x2, y2)
+
+    def _add_manual_box(self):
+        """Add a ready-made manual box in the center of the current frame."""
+        if self._display_info is None:
+            self._set_status("START A SOURCE FIRST BEFORE ADDING A MANUAL BOX", RED)
+            return
+
+        scale, offset_x, offset_y, original_w, original_h = self._display_info
+        box_w = max(70, int(original_w * 0.14))
+        box_h = max(85, int(original_h * 0.18))
+        cx = original_w // 2
+        cy = original_h // 2
+        new_box = self._clamp_manual_box(
+            (cx - box_w // 2, cy - box_h // 2, cx + box_w // 2, cy + box_h // 2),
+            original_w,
+            original_h
+        )
+
+        with self._faces_lock:
+            self.manual_boxes.append({
+                "box": new_box,
+                "start_frame": self._manual_start_frame_for_new_box(),
+                "end_frame": None,
+            })
+            self.selected_manual_box_index = len(self.manual_boxes) - 1
+
+        self.show_boxes_value = True
+        self.show_boxes.set(True)
+        self._refresh_boxes_button()
+        self._refresh_manual_time_label()
+        self._set_status("MANUAL BOX READY — DRAG IT OR RESIZE FROM THE CORNERS", GOLD)
+
+    def _remove_selected_manual_box(self):
+        with self._faces_lock:
+            if not self.manual_boxes:
+                self._set_status("NO MANUAL BOX TO REMOVE", RED)
+                return
+
+            index = self.selected_manual_box_index
+            if index is None or not (0 <= index < len(self.manual_boxes)):
+                index = len(self.manual_boxes) - 1
+
+            self.manual_boxes.pop(index)
+            if self.manual_boxes:
+                self.selected_manual_box_index = min(index, len(self.manual_boxes) - 1)
+            else:
+                self.selected_manual_box_index = None
+
+        self._refresh_manual_time_label()
+        self._set_status("MANUAL BOX REMOVED", GREEN)
+
+    def _clear_manual_boxes(self):
+        with self._faces_lock:
+            self.manual_boxes = []
+            self.selected_manual_box_index = None
+            self._manual_drag_mode = None
+            self._manual_drag_start = None
+            self._manual_drag_start_box = None
+
+        self._refresh_manual_time_label()
+        self._set_status("ALL MANUAL BOXES CLEARED", GREEN)
+
+    def _manual_start_frame_for_new_box(self):
+        if self.source_mode_value == "video" and self.video_total_frames > 0:
+            return max(0, int(self._current_video_frame))
+        return 0
+
+    def _manual_box_tuple(self, item):
+        """Return a safe (x1, y1, x2, y2) tuple from either old tuple boxes or new timed dict boxes."""
+        if isinstance(item, dict):
+            raw_box = item.get("box", (0, 0, 1, 1))
+        else:
+            raw_box = item
+
+        try:
+            x1, y1, x2, y2 = raw_box
+            return (int(x1), int(y1), int(x2), int(y2))
+        except Exception:
+            return (0, 0, 1, 1)
+
+    def _set_manual_box_tuple_locked(self, index, box):
+        if not (0 <= index < len(self.manual_boxes)):
+            return
+        item = self.manual_boxes[index]
+        if isinstance(item, dict):
+            item["box"] = tuple(box)
+        else:
+            self.manual_boxes[index] = tuple(box)
+
+    def _manual_box_is_active_locked(self, item, frame_index=None):
+        if self.source_mode_value != "video" or self.video_total_frames <= 0:
+            return True
+
+        if frame_index is None:
+            frame_index = int(self._current_video_frame)
+
+        if not isinstance(item, dict):
+            return True
+
+        start_frame = int(item.get("start_frame", 0) or 0)
+        end_frame = item.get("end_frame", None)
+
+        if frame_index < start_frame:
+            return False
+        if end_frame is not None and frame_index > int(end_frame):
+            return False
+        return True
+
+    def _get_active_manual_entries_locked(self):
+        entries = []
+        frame_index = int(self._current_video_frame)
+        for index, item in enumerate(self.manual_boxes):
+            if self._manual_box_is_active_locked(item, frame_index):
+                entries.append((index, self._manual_box_tuple(item)))
+        return entries
+
+    def _get_active_manual_entries(self):
+        with self._faces_lock:
+            return self._get_active_manual_entries_locked()
+
+    def _current_video_time_text(self):
+        if self.source_mode_value == "video" and self.video_fps:
+            return self._format_seconds(int(self._current_video_frame) / self.video_fps)
+        return "current frame"
+
+    def _refresh_manual_time_label(self):
+        if not hasattr(self, "manual_time_var"):
+            return
+
+        with self._faces_lock:
+            index = self.selected_manual_box_index
+            if index is None or not (0 <= index < len(self.manual_boxes)):
+                text = "No manual box selected"
+            else:
+                item = self.manual_boxes[index]
+                if self.source_mode_value == "video" and isinstance(item, dict) and self.video_fps:
+                    start = int(item.get("start_frame", 0) or 0)
+                    end = item.get("end_frame", None)
+                    start_text = self._format_seconds(start / self.video_fps)
+                    end_text = "video end" if end is None else self._format_seconds(int(end) / self.video_fps)
+                    text = f"Selected manual box: {start_text} → {end_text}"
+                else:
+                    text = "Selected manual box: active until removed"
+
+        def _do():
+            try:
+                self.manual_time_var.set(text)
+            except Exception:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _do()
+            else:
+                self.root.after(0, _do)
+        except Exception:
+            pass
+
+    def _set_selected_manual_end_current(self):
+        if self.source_mode_value != "video" or self.video_total_frames <= 0:
+            self._set_status("TIMED MANUAL BOX REMOVAL WORKS IN VIDEO MODE", RED)
+            return
+
+        with self._faces_lock:
+            index = self.selected_manual_box_index
+            if index is None or not (0 <= index < len(self.manual_boxes)):
+                self._set_status("SELECT A MANUAL BOX FIRST", RED)
+                return
+
+            item = self.manual_boxes[index]
+            if not isinstance(item, dict):
+                item = {"box": tuple(item), "start_frame": 0, "end_frame": None}
+                self.manual_boxes[index] = item
+
+            start = int(item.get("start_frame", 0) or 0)
+            current = max(start, min(int(self._current_video_frame), max(0, self.video_total_frames - 1)))
+            item["end_frame"] = current
+
+        self._refresh_manual_time_label()
+        self._set_status(f"MANUAL BOX WILL BE REMOVED AFTER {self._format_seconds(current / self.video_fps)}", GREEN)
+
+    def _clear_selected_manual_end(self):
+        with self._faces_lock:
+            index = self.selected_manual_box_index
+            if index is None or not (0 <= index < len(self.manual_boxes)):
+                self._set_status("SELECT A MANUAL BOX FIRST", RED)
+                return
+
+            item = self.manual_boxes[index]
+            if isinstance(item, dict):
+                item["end_frame"] = None
+            else:
+                self.manual_boxes[index] = {"box": tuple(item), "start_frame": 0, "end_frame": None}
+
+        self._refresh_manual_time_label()
+        self._set_status("MANUAL BOX WILL STAY UNTIL VIDEO END", GREEN)
 
     def _point_inside_box(self, x, y, box):
         x1, y1, x2, y2 = box
@@ -1142,14 +1596,28 @@ class FacelockApp:
 
         return active_faces, skipped_faces
 
+    def _clear_detected_face_selection(self):
+        with self._faces_lock:
+            self.current_faces = []
+            self.disabled_faces = []
+
     def _clear_face_selection(self):
         with self._faces_lock:
             self.current_faces = []
             self.disabled_faces = []
+            self.manual_boxes = []
+            self.selected_manual_box_index = None
+            self._manual_drag_mode = None
+            self._manual_drag_start = None
+            self._manual_drag_start_box = None
         self._display_info = None
+        self._current_video_frame = 0
+        self._last_raw_video_frame = None
+        self._refresh_manual_time_label()
 
     # ─── BUTTON HIGHLIGHTING ─────────────────
     def _select_effect(self, key):
+        self.effect_value = key
         self.effect.set(key)
         for k, btn in self._fx_btns.items():
             if k == key:
@@ -1163,10 +1631,13 @@ class FacelockApp:
                           fg=GOLD if k == key else SILVER)
 
     def _on_intensity_change(self, val):
-        self.intensity_label.configure(text=str(int(float(val))))
+        value = max(1, min(100, int(float(val))))
+        self.intensity_value = value
+        self.intensity_label.configure(text=str(value))
 
     def _on_detect_every_change(self, val):
         value = max(1, int(float(val)))
+        self.detect_every_value = value
         self.detect_every_label.configure(text=f"ASYNC DETECT EVERY {value} FRAME" + ("" if value == 1 else "S"))
         self._reset_detection_cache()
 
@@ -1174,6 +1645,7 @@ class FacelockApp:
         if key not in ("sensitive", "balanced", "strict"):
             key = "balanced"
 
+        self.filter_mode_value = key
         self.filter_mode.set(key)
         self.detector.set_filter_mode(key)
 
@@ -1191,7 +1663,7 @@ class FacelockApp:
 
     def _cycle_filter_mode(self):
         order = ["sensitive", "balanced", "strict"]
-        current = self.filter_mode.get()
+        current = self.filter_mode_value
         try:
             index = order.index(current)
         except ValueError:
@@ -1199,14 +1671,15 @@ class FacelockApp:
         self._select_filter_mode(order[(index + 1) % len(order)])
 
     def _on_video_speed_change(self, value):
+        try:
+            text = str(value).lower().replace("x", "").replace(",", ".")
+            self.playback_speed_value_cached = max(0.25, float(text))
+        except ValueError:
+            self.playback_speed_value_cached = 1.0
         self._set_status(f"VIDEO SPEED SET TO {value}", GOLD)
 
     def _playback_speed_value(self):
-        try:
-            text = self.playback_speed.get().lower().replace("x", "").replace(",", ".")
-            return max(0.25, float(text))
-        except ValueError:
-            return 1.0
+        return self.playback_speed_value_cached
 
     def _format_seconds(self, seconds):
         seconds = max(0, int(seconds))
@@ -1241,18 +1714,19 @@ class FacelockApp:
 
     def _on_video_seek_release(self, event):
         self._video_slider_dragging = False
-        if self.source_mode.get() != "video" or self.video_total_frames <= 0:
+        if self.source_mode_value != "video" or self.video_total_frames <= 0:
             return
 
         ratio = self.video_progress.get() / 1000
         target_frame = int(ratio * max(0, self.video_total_frames - 1))
+        self._current_video_frame = target_frame
 
         with self._video_seek_lock:
             self._pending_seek_frame = target_frame
 
         # Seeking jumps to another part of the video
-        # Clear selection to keep privacy-safe default behavior
-        self._clear_face_selection()
+        # Clear only clicked-off detected faces while keeping manual timed boxes on the timeline
+        self._clear_detected_face_selection()
         self._reset_detection_cache()
         self._set_status(f"SEEKING TO {self._format_seconds(target_frame / self.video_fps)}", GOLD)
 
@@ -1368,7 +1842,7 @@ class FacelockApp:
         if mode_label == "IMAGE":
             return self._detect_faces_safely(frame)
 
-        detect_every = max(1, int(self.detect_every.get()))
+        detect_every = max(1, int(self.detect_every_value))
 
         with self._detector_lock:
             source_changed = self._last_detection_source != mode_label
@@ -1415,15 +1889,16 @@ class FacelockApp:
             return list(self._smoothed_faces)
 
     def _toggle_boxes(self):
-        self.show_boxes.set(not self.show_boxes.get())
+        self.show_boxes_value = not self.show_boxes_value
+        self.show_boxes.set(self.show_boxes_value)
         self._refresh_boxes_button()
-        if self.show_boxes.get():
+        if self.show_boxes_value:
             self._set_status("FACE BOXES ARE VISIBLE", GREEN)
         else:
             self._set_status("FACE BOXES ARE HIDDEN", GOLD)
 
     def _refresh_boxes_button(self):
-        if self.show_boxes.get():
+        if self.show_boxes_value:
             self.btn_boxes.configure(text="▣  BOXES ON", fg=GOLD2)
         else:
             self.btn_boxes.configure(text="□  BOXES OFF", fg=SILVER)
@@ -1432,6 +1907,7 @@ class FacelockApp:
     def _select_source(self, mode):
         self._stop_action()
         self._clear_face_selection()
+        self.source_mode_value = mode
         self.source_mode.set(mode)
         self._highlight_source(mode)
 
@@ -1447,6 +1923,7 @@ class FacelockApp:
                 self._set_status(f"IMAGE LOADED — {os.path.basename(path)}", GOLD)
                 self.btn_start.configure(state="normal", fg=GOLD)
             else:
+                self.source_mode_value = "none"
                 self.source_mode.set("none")
                 self._highlight_source("none")
 
@@ -1462,6 +1939,7 @@ class FacelockApp:
                 self.btn_start.configure(state="normal", fg=GOLD)
                 self.btn_rec.configure(state="normal", fg="#E67E22")
             else:
+                self.source_mode_value = "none"
                 self.source_mode.set("none")
                 self._highlight_source("none")
 
@@ -1474,7 +1952,7 @@ class FacelockApp:
 
     # ─── START / STOP ────────────────────────
     def _start_action(self):
-        mode = self.source_mode.get()
+        mode = self.source_mode_value
         if mode == "none":
             self._set_status("SELECT A SOURCE FIRST", RED)
             return
@@ -1484,7 +1962,11 @@ class FacelockApp:
         self._stop_event.clear()
         self.running = True
         self.frame_count = 0
+        self.paused_value = False
+        self.paused.set(False)
         self.btn_start.configure(state="disabled", fg=BORDER)
+        self.btn_pause.configure(state="normal" if mode == "video" else "disabled", fg=GOLD2 if mode == "video" else BORDER)
+        self.btn_pause.configure(text="Ⅱ  PAUSE VIDEO")
         self.btn_stop.configure(state="normal", fg=RED)
         self.btn_save.configure(state="normal", fg=SILVER)
         self.canvas.delete(self._idle_id)
@@ -1504,6 +1986,8 @@ class FacelockApp:
         self._stop_event.set()
         self.running = False
         self._reset_detection_cache()
+        self.paused_value = False
+        self.paused.set(False)
 
         # Wait for the background thread to finish so it can cleanly
         # release its own cap reference before we touch UI.
@@ -1521,6 +2005,7 @@ class FacelockApp:
         self.cap = None
 
         self.btn_start.configure(state="normal", fg=GOLD)
+        self.btn_pause.configure(state="disabled", fg=BORDER, text="Ⅱ  PAUSE VIDEO")
         self.btn_stop.configure(state="disabled", fg=BORDER)
         self.btn_save.configure(state="disabled", fg=BORDER)
         self.status_dot.configure(fg=BORDER)
@@ -1540,6 +2025,20 @@ class FacelockApp:
             text="WEBCAM  ·  VIDEO  ·  IMAGE",
             font=(FONT_MONO, 9), fill="#1A1D28", anchor="center"
         )
+
+    def _toggle_pause(self):
+        if self.source_mode_value != "video" or not self.running:
+            self._set_status("PAUSE IS AVAILABLE IN VIDEO MODE AFTER START", RED)
+            return
+
+        self.paused_value = not self.paused_value
+        self.paused.set(self.paused_value)
+        if self.paused_value:
+            self.btn_pause.configure(text="▶  RESUME VIDEO", fg=GREEN)
+            self._set_status("VIDEO PAUSED — MOVE OR RESIZE MANUAL BOXES", GOLD)
+        else:
+            self.btn_pause.configure(text="Ⅱ  PAUSE VIDEO", fg=GOLD2)
+            self._set_status("VIDEO RESUMED", GREEN)
 
     # ─── RECORDING ───────────────────────────
     def _toggle_record(self):
@@ -1596,41 +2095,73 @@ class FacelockApp:
 
     def _process_frame(self, frame, mode_label):
         detected_faces = self._get_detected_faces(frame, mode_label)
-        faces_to_anonymize, skipped_faces = self._filter_faces_for_anonymization(detected_faces)
+        detected_to_anonymize, skipped_faces = self._filter_faces_for_anonymization(detected_faces)
+        active_manual_entries = self._get_active_manual_entries()
+        manual_faces = [box for _, box in active_manual_entries]
+        selected_manual_index = None
+        with self._faces_lock:
+            selected_original_index = self.selected_manual_box_index
+        for display_index, (original_index, _) in enumerate(active_manual_entries):
+            if original_index == selected_original_index:
+                selected_manual_index = display_index
+                break
+        faces_to_anonymize = detected_to_anonymize + manual_faces
+        all_faces = detected_faces + manual_faces
 
         # Default behavior
-        # Every detected face is anonymized unless the user clicked its box
-        frame = Anonymizer.apply(frame, faces_to_anonymize, self.effect.get(), self.intensity.get())
+        # Every detected face and every manual box is anonymized unless a detected face was clicked off
+        # Manual boxes stay privacy-safe and are always anonymized until the user removes the whole manual box
+        effect_value = self.effect_value
+        intensity_value = self.intensity_value
+        show_boxes_value = self.show_boxes_value
+
+        frame = Anonymizer.apply(frame, faces_to_anonymize, effect_value, intensity_value)
 
         fps = self._calc_fps()
-        frame = draw_hud(frame, faces_to_anonymize, self.effect.get(), self.intensity.get(),
+        frame = draw_hud(frame, detected_to_anonymize, effect_value, intensity_value,
                          mode_label, fps, self.frame_count, skipped_faces,
-                         show_boxes=self.show_boxes.get())
+                         show_boxes=show_boxes_value,
+                         manual_boxes=manual_faces,
+                         selected_manual_index=selected_manual_index)
         self._last_frame = frame.copy()
         if self._recording and self._writer:
             self._writer.write(frame)
         self.frame_count += 1
-        self._update_stats(f"{len(faces_to_anonymize)} / {len(detected_faces)}", fps, self.frame_count, mode_label)
+        self._update_stats(f"{len(faces_to_anonymize)} / {len(all_faces)}", fps, self.frame_count, mode_label)
         self._push_frame(frame)
 
     def _push_frame(self, frame):
-        """Schedule frame display on the main Tkinter thread without queueing old frames."""
+        """Store the newest frame from the worker thread.
+        The Tkinter canvas is updated by _poll_pending_frame on the main thread.
+        """
         with self._frame_lock:
             self._pending_frame = frame
-            if self._draw_scheduled:
-                return
-            self._draw_scheduled = True
 
-        self.root.after(0, self._draw_pending_frame)
+    def _poll_pending_frame(self):
+        """Draw the newest pending frame from the Tkinter main thread.
+        This avoids calling Tkinter drawing or root.after repeatedly from the video thread.
+        """
+        if getattr(self, "_ui_closed", False):
+            return
 
-    def _draw_pending_frame(self):
+        frame = None
         with self._frame_lock:
-            frame = self._pending_frame
-            self._pending_frame = None
-            self._draw_scheduled = False
+            if self._pending_frame is not None:
+                frame = self._pending_frame
+                self._pending_frame = None
 
         if frame is not None:
-            self._draw_frame(frame)
+            try:
+                self._draw_frame(frame)
+            except Exception:
+                import traceback
+                print("[FACELOCK] Frame draw failed")
+                traceback.print_exc()
+
+        try:
+            self.root.after(15, self._poll_pending_frame)
+        except Exception:
+            pass
 
     def _draw_frame(self, frame):
         """Convert OpenCV BGR frame → Tkinter PhotoImage and draw on canvas.
@@ -1711,9 +2242,35 @@ class FacelockApp:
                 if seek_frame is not None:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
                     self.frame_count = seek_frame
+                    self._current_video_frame = seek_frame
+                    self._last_raw_video_frame = None
                     self._reset_detection_cache()
                     self._update_video_progress(seek_frame, force=True)
+
+                    # When paused, show the seek target immediately so manual boxes can be placed there.
+                    if self.paused_value:
+                        ret_seek, seek_image = cap.read()
+                        if ret_seek:
+                            shown_frame = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+                            self.frame_count = shown_frame
+                            self._current_video_frame = shown_frame
+                            self._last_raw_video_frame = seek_image.copy()
+                            self._process_frame(seek_image, "VIDEO")
+                            self._update_video_progress(shown_frame, force=True)
+
+                    self._refresh_manual_time_label()
                     next_frame_time = time.time()
+
+                if self.paused_value:
+                    # Keep the exact paused frame visible while allowing manual boxes to move
+                    # and update their anonymized area without advancing the video.
+                    if self._last_raw_video_frame is not None:
+                        self.frame_count = self._current_video_frame
+                        self._process_frame(self._last_raw_video_frame.copy(), "VIDEO")
+                        self._update_video_progress(self._current_video_frame, force=True)
+                    next_frame_time = time.time()
+                    time.sleep(0.05)
+                    continue
 
                 ret, frame = cap.read()
                 if not ret:
@@ -1722,6 +2279,8 @@ class FacelockApp:
 
                 current_frame = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
                 self.frame_count = current_frame
+                self._current_video_frame = current_frame
+                self._last_raw_video_frame = frame.copy()
                 self._process_frame(frame, "VIDEO")
                 self._update_video_progress(current_frame)
 
@@ -1759,7 +2318,16 @@ class FacelockApp:
 
     def _on_key(self, event):
         k = event.char.lower()
-        if k == 'a':
+        key = event.keysym
+        if key == "Delete":
+            self._remove_selected_manual_box()
+        elif key == "space":
+            self._toggle_pause()
+        elif k == 't':
+            self._set_selected_manual_end_current()
+        elif k == 'm':
+            self._add_manual_box()
+        elif k == 'a':
             with self._faces_lock:
                 self.disabled_faces = []
             self._set_status("ALL DETECTED FACES WILL BE ANONYMIZED", GREEN)
@@ -1774,11 +2342,13 @@ class FacelockApp:
         elif k == 'r':
             self._select_effect("redact")
         elif k == '+' or k == '=':
-            self.intensity.set(min(100, self.intensity.get() + 5))
-            self.intensity_label.configure(text=str(self.intensity.get()))
+            self.intensity_value = min(100, self.intensity_value + 5)
+            self.intensity.set(self.intensity_value)
+            self.intensity_label.configure(text=str(self.intensity_value))
         elif k == '-':
-            self.intensity.set(max(1, self.intensity.get() - 5))
-            self.intensity_label.configure(text=str(self.intensity.get()))
+            self.intensity_value = max(1, self.intensity_value - 5)
+            self.intensity.set(self.intensity_value)
+            self.intensity_label.configure(text=str(self.intensity_value))
         elif k == 's':
             self._save_frame()
         elif k == 'q':
@@ -1786,6 +2356,7 @@ class FacelockApp:
 
     # ─── CLOSE ───────────────────────────────
     def _on_close(self):
+        self._ui_closed = True
         self._stop_event.set()
         self.running = False
         if self._writer:
