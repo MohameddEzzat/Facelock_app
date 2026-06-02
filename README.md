@@ -162,6 +162,6 @@ You can add a ready box, then drag or resize it over the face. For videos, you c
 
 ## Contributors
 
-1. Mohamed Ezzat - https://github.com/MohameddEzzat
-2. Omar Bahgat - https://github.com/Omar-Bahgat67
-3.
+Mohamed Ezzat
+Omar Bahgat
+Omar Mosaad
