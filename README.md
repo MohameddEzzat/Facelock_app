@@ -1,10 +1,10 @@
-# FACELOCK
+FACELOCK
 
 FACELOCK is a Python desktop application for automatic face anonymization in images, videos, and webcam footage.
 
 The app detects faces using OpenCV YuNet and applies privacy effects such as blur, pixelation, or full redaction. It is designed for privacy-aware use cases, such as anonymizing people in social media content, surveillance footage, journalistic material, or recorded videos before sharing them publicly.
 
-## Features
+Features
 
 - Detect faces in images, videos, and webcam input.
 - Apply blur, pixelation, or black redaction.
@@ -23,7 +23,7 @@ The app detects faces using OpenCV YuNet and applies privacy effects such as blu
 - Record processed video output.
 - View live stats, such as FPS, frame count, and detected targets.
 
-## Tech Stack
+Tech Stack
 
 - Python
 - Tkinter
@@ -32,54 +32,42 @@ The app detects faces using OpenCV YuNet and applies privacy effects such as blu
 - NumPy
 - Pillow
 
-## Project Structure
+Project Structure
 
-```text
 Facelock_app/
 ├── facelock.py
 ├── face_detection_yunet_2023mar.onnx
 └── requirments.txt
-```
 
-## Requirements
+Requirements
 
 Install the required Python packages using the existing dependency file:
 
-```bash
 pip install -r requirments.txt
-```
 
-> Note:  
-> The file is currently named `requirments.txt` in the repository.  
-> You can rename it later to `requirements.txt` for the standard Python naming convention.
+«Note:
+The file is currently named "requirments.txt" in the repository.
+You can rename it later to "requirements.txt" for the standard Python naming convention.»
 
-## How to Run
+How to Run
 
 Clone the repository:
 
-```bash
 git clone https://github.com/MohameddEzzat/Facelock_app.git
-```
 
 Open the project folder:
 
-```bash
 cd Facelock_app
-```
 
 Install dependencies:
 
-```bash
 pip install -r requirments.txt
-```
 
 Run the app:
 
-```bash
 python facelock.py
-```
 
-## How to Use
+How to Use
 
 1. Open the application.
 2. Choose a source:
@@ -99,41 +87,41 @@ python facelock.py
 7. Use manual boxes if a face is missed.
 8. Save the processed frame or record the processed video.
 
-## Detection Modes
+Detection Modes
 
-### Sensitive
+Sensitive
 
 Catches more small or hard-to-detect faces, but may allow more false positives.
 
-### Balanced
+Balanced
 
 Recommended default mode for normal use.
 
-### Strict
+Strict
 
 Reduces fake detections, but may miss tiny or side faces.
 
-## Privacy Effects
+Privacy Effects
 
-### Blur
+Blur
 
 Applies Gaussian blur to detected face regions.
 
-### Pixel
+Pixel
 
 Applies a pixelated mosaic effect to detected face regions.
 
-### Redact
+Redact
 
 Covers detected face regions with a black box.
 
-## Manual Boxes
+Manual Boxes
 
 Manual boxes are used when the detector misses a face.
 
 You can add a ready box, then drag or resize it over the face. For videos, you can pause or seek to a specific frame, then set when the selected manual box should be removed.
 
-## Use Cases
+Use Cases
 
 - Anonymizing faces in social media videos.
 - Protecting identities in public footage.
@@ -142,15 +130,15 @@ You can add a ready box, then drag or resize it over the face. For videos, you c
 - Redacting people from journalistic or documentary material.
 - Processing webcam or video footage before sharing.
 
-## Notes
+Notes
 
-- The YuNet model file must stay in the same folder as `facelock.py`.
+- The YuNet model file must stay in the same folder as "facelock.py".
 - If YuNet cannot load, the app falls back to Haar Cascade detection.
 - For best results, use well-lit images or videos.
 - Strict mode can help reduce false detections.
 - Sensitive mode can help with small or distant faces.
 
-## Future Improvements
+Future Improvements
 
 - Convert the app into a web application.
 - Add batch processing for multiple files.
@@ -160,8 +148,8 @@ You can add a ready box, then drag or resize it over the face. For videos, you c
 - Add a cleaner project structure.
 - Add screenshots or demo GIFs to the README.
 
-## Contributors
+Contributors
 
-1. [Mohamed Ezzat](https://github.com/MohameddEzzat)
-2. 
-3. 
+1. Mohamed Ezzat - https://github.com/MohameddEzzat
+2. Omar Bahgat - https://github.com/Omar-Bahgat67
+3.
